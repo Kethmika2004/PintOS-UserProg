@@ -63,6 +63,7 @@ static void paging_init (void);
 static char **read_command_line (void);
 static char **parse_options (char **argv);
 static void run_actions (char **argv);
+static void run_shell (void);
 static void usage (void);
 
 #ifdef FILESYS
@@ -133,7 +134,8 @@ pintos_init (void)
     /* Run actions specified on kernel command line. */
     run_actions (argv);
   } else {
-    // TODO: no command line passed to kernel. Run interactively 
+    // TODO: no command line passed to kernel. Run interactively
+    run_shell (); 
   }
 
   /* Finish up. */
@@ -431,3 +433,67 @@ locate_block_device (enum block_type role, const char *name)
     }
 }
 #endif
+
+static void
+run_shell (void)
+{
+  char line[128];
+  size_t pos;
+  int c;
+
+  for (;;)
+    {
+      printf ("CS2042> ");
+      pos = 0;
+
+      for (;;)
+        {
+          c = input_getc ();
+
+          if (c == '\r' || c == '\n')
+            {
+              printf ("\n");
+              break;
+            }
+          else if (c == '\b' || c == 127)
+            {
+              if (pos > 0)
+                {
+                  pos--;
+                  printf ("\b \b");
+                }
+            }
+          else if (pos < sizeof line - 1)
+            {
+              line[pos++] = c;
+              printf ("%c", c);
+            }
+        }
+      line[pos] = '\0';
+
+      if (strcmp (line, "") == 0)
+        continue;
+      else if (strcmp (line, "whoami") == 0)
+        printf ("CS2042 - Yasandu Kethmika, 240348M \n");
+      else if (strcmp (line, "shutdown") == 0)
+        {
+          printf ("Shutting down...\n");
+          shutdown_power_off ();
+        }
+      else if (strcmp (line, "time") == 0)
+        printf ("%lu\n", (unsigned long) rtc_get_time ());
+      else if (strcmp (line, "ram") == 0)
+        printf ("%"PRIu32" kB\n", init_ram_pages * PGSIZE / 1024);
+      else if (strcmp (line, "thread") == 0)
+        thread_print_stats ();
+      else if (strcmp (line, "priority") == 0)
+        printf ("%d\n", thread_get_priority ());
+      else if (strcmp (line, "exit") == 0)
+        {
+          printf ("Exiting interactive shell...Bye!\n");
+          break;
+        }
+      else
+        printf ("%s: command not found\n", line);
+    }
+}
