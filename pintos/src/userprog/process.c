@@ -17,6 +17,7 @@
 #include "threads/palloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#define MAX_ARGS 64
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
@@ -31,6 +32,14 @@ process_execute (const char *file_name)
   char *fn_copy;
   tid_t tid;
 
+  // Local buffer to hold the program name, which is extracted from file_name
+  char prog_name[16];
+  char *save_ptr;
+
+  // make a copy of file_name to extract the program name
+  strlcpy (prog_name, file_name, sizeof prog_name);
+  strtok_r (prog_name, " ", &save_ptr);
+
   /* Make a copy of FILE_NAME.
      Otherwise there's a race between the caller and load(). */
   fn_copy = palloc_get_page (0);
@@ -39,10 +48,73 @@ process_execute (const char *file_name)
   strlcpy (fn_copy, file_name, PGSIZE);
 
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
+  tid = thread_create (prog_name, PRI_DEFAULT, start_process, fn_copy);
   if (tid == TID_ERROR)
     palloc_free_page (fn_copy); 
   return tid;
+}
+
+static bool
+push_arguments (char **argv, int argc, void **esp)
+{
+  uint8_t *sp;
+  char *arg_addr[MAX_ARGS];
+  char **argv_head;
+  int total_size;
+  int i;
+
+  ASSERT (argc <= MAX_ARGS);
+
+  sp = (uint8_t *) *esp;
+  total_size = 0;
+
+  for (i = 0; i < argc; i++)
+    total_size += strlen (argv[i]) + 1;
+
+  total_size += 3;
+  total_size += (argc + 1) * sizeof (char *);
+  total_size += sizeof (char **) + sizeof (int) + sizeof (void *);
+
+  if (total_size > PGSIZE)
+    return false;
+
+  // Step 1: Push argument strings in reverse order.
+  for (i = argc - 1; i >= 0; i--)
+    {
+      size_t len = strlen (argv[i]) + 1;
+      sp -= len;
+      memcpy (sp, argv[i], len);
+      arg_addr[i] = (char *) sp;
+    }
+
+  // Step 2: Word-align to a multiple of 4. 
+  sp = (uint8_t *) ((uintptr_t) sp & ~3);
+
+  // Step 3: Push NULL sentinel for argv[argc].
+  sp -= sizeof (char *);
+  memset (sp, 0, sizeof (char *));
+
+  // Push pointers to the strings on stack in reverse order. 
+  for (i = argc - 1; i >= 0; i--)
+    {
+      sp -= sizeof (char *);
+      memcpy (sp, &arg_addr[i], sizeof (char *));
+    }
+
+  // Step 4: Push argv, argc, and fake return address. 
+  argv_head = (char **) sp;
+
+  sp -= sizeof (char **);
+  memcpy (sp, &argv_head, sizeof (char **));
+
+  sp -= sizeof (int);
+  memcpy (sp, &argc, sizeof (int));
+
+  sp -= sizeof (void *);
+  memset (sp, 0, sizeof (void *));
+
+  *esp = (void *) sp;
+  return true;
 }
 
 /* A thread function that loads a user process and starts it
@@ -54,15 +126,47 @@ start_process (void *file_name_)
   struct intr_frame if_;
   bool success;
 
-  /* Initialize interrupt frame and load executable. */
+  char *argv[MAX_ARGS];
+  int argc;
+  char *token, *save_ptr;
+
+  argc = 0;
+
+  // Tokenize command line in place within fn_copy.
+  for (token = strtok_r (file_name, " ", &save_ptr); token != NULL;
+       token = strtok_r (NULL, " ", &save_ptr))
+    {
+      if (argc >= MAX_ARGS)
+        {
+          palloc_free_page (file_name);
+          thread_exit ();
+        }
+      argv[argc++] = token;
+    }
+
+  // Handle empty or whitespace-only inputs without calling load(NULL).
+  if (argc == 0)
+    {
+      palloc_free_page (file_name);
+      thread_exit ();
+    }
+
+  // Initialize interrupt frame and load executable.
+  // Pass argv[0] (only the program name), not the full string.
   memset (&if_, 0, sizeof if_);
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
-  success = load (file_name, &if_.eip, &if_.esp);
+  success = load (argv[0], &if_.eip, &if_.esp);
 
-  /* If load failed, quit. */
+  // Set up stack arguments only after load() succeeds and initializes if_.esp.
+  if (success)
+    success = push_arguments (argv, argc, &if_.esp);
+
+  // Arguments are copied into user space; free the command line page now.
   palloc_free_page (file_name);
+
+  // If load or stack setup failed, quit.
   if (!success) 
     thread_exit ();
 
@@ -88,6 +192,7 @@ start_process (void *file_name_)
 int
 process_wait (tid_t child_tid UNUSED) 
 {
+  while (1);   // TEMP: replaced when we do the wait syscall
   return -1;
 }
 
@@ -103,6 +208,8 @@ process_exit (void)
   pd = cur->pagedir;
   if (pd != NULL) 
     {
+      printf ("%s: exit(%d)\n", cur->name, cur->exit_code);
+
       /* Correct ordering here is crucial.  We must set
          cur->pagedir to NULL before switching page directories,
          so that a timer interrupt can't switch back to the
