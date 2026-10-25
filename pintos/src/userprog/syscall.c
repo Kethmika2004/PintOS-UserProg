@@ -9,26 +9,45 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <syscall-nr.h>
+#include "devices/input.h"
 #include "devices/shutdown.h"
+#include "filesys/file.h"
+#include "filesys/filesys.h"
 #include "threads/interrupt.h"
+#include "threads/malloc.h"
+#include "threads/synch.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 #include "userprog/pagedir.h"
 #include "userprog/process.h"
 
+/* Global lock serializing access to the file system. */
+struct lock filesys_lock;
+
 /* Forward declarations. */
 static void syscall_handler (struct intr_frame *);
+static void exit_with_status (int status) NO_RETURN;
 static void fail_invalid_access (void) NO_RETURN;
 static bool is_valid_ptr (const void *uaddr);
 static void check_valid_buffer (const void *uaddr, size_t size);
-static void check_valid_string (const char *ustr) UNUSED;
+static void check_valid_string (const char *ustr);
 static uint32_t get_user_arg (const void *uaddr);
 static uint32_t get_arg (struct intr_frame *f, int n);
+static struct fd_entry *find_fd (int fd);
 
 void
 syscall_init (void) 
 {
+  lock_init (&filesys_lock);
   intr_register_int (0x30, 3, INTR_ON, syscall_handler, "syscall");
+}
+
+/* Terminates the current user process with the given exit status. */
+static void
+exit_with_status (int status)
+{
+  thread_current ()->exit_code = status;
+  thread_exit ();
 }
 
 /* Memory Validation Helpers. */
@@ -37,8 +56,7 @@ syscall_init (void)
 static void
 fail_invalid_access (void)
 {
-  thread_current ()->exit_code = -1;
-  thread_exit ();
+  exit_with_status (-1);
 }
 
 /* Checks if a pointer is in user space and mapped in the page table. */
@@ -127,6 +145,24 @@ get_arg (struct intr_frame *f, int n)
   return get_user_arg ((uint8_t *) f->esp + 4 * n);
 }
 
+/* Looks up FD in the current thread's open file table, returning NULL
+   if no matching descriptor is open. */
+static struct fd_entry *
+find_fd (int fd)
+{
+  struct thread *cur = thread_current ();
+  struct list_elem *e;
+
+  for (e = list_begin (&cur->open_files); e != list_end (&cur->open_files);
+       e = list_next (e))
+    {
+      struct fd_entry *fde = list_entry (e, struct fd_entry, elem);
+      if (fde->fd == fd)
+        return fde;
+    }
+  return NULL;
+}
+
 /* System Call Dispatcher. */
 
 static void
@@ -142,9 +178,119 @@ syscall_handler (struct intr_frame *f)
       break;
 
     case SYS_EXIT:
-      thread_current ()->exit_code = (int) get_arg (f, 1);
-      thread_exit ();
+      exit_with_status ((int) get_arg (f, 1));
       break;
+
+    case SYS_EXEC:
+      {
+        const char *cmd_line = (const char *) get_arg (f, 1);
+        check_valid_string (cmd_line);
+        f->eax = (uint32_t) process_execute (cmd_line);
+        break;
+      }
+
+    case SYS_WAIT:
+      f->eax = (uint32_t) process_wait ((tid_t) get_arg (f, 1));
+      break;
+
+    case SYS_CREATE:
+      {
+        const char *file = (const char *) get_arg (f, 1);
+        unsigned initial_size = (unsigned) get_arg (f, 2);
+
+        check_valid_string (file);
+        lock_acquire (&filesys_lock);
+        f->eax = filesys_create (file, initial_size);
+        lock_release (&filesys_lock);
+        break;
+      }
+
+    case SYS_REMOVE:
+      {
+        const char *file = (const char *) get_arg (f, 1);
+
+        check_valid_string (file);
+        lock_acquire (&filesys_lock);
+        f->eax = filesys_remove (file);
+        lock_release (&filesys_lock);
+        break;
+      }
+
+    case SYS_OPEN:
+      {
+        const char *file = (const char *) get_arg (f, 1);
+        struct file *fp;
+        struct fd_entry *fde;
+
+        check_valid_string (file);
+        lock_acquire (&filesys_lock);
+        fp = filesys_open (file);
+        lock_release (&filesys_lock);
+
+        if (fp == NULL)
+          {
+            f->eax = (uint32_t) -1;
+            break;
+          }
+
+        fde = malloc (sizeof *fde);
+        if (fde == NULL)
+          {
+            lock_acquire (&filesys_lock);
+            file_close (fp);
+            lock_release (&filesys_lock);
+            f->eax = (uint32_t) -1;
+            break;
+          }
+
+        fde->fd = thread_current ()->next_fd++;
+        fde->file = fp;
+        list_push_back (&thread_current ()->open_files, &fde->elem);
+        f->eax = (uint32_t) fde->fd;
+        break;
+      }
+
+    case SYS_FILESIZE:
+      {
+        int fd = (int) get_arg (f, 1);
+        struct fd_entry *fde = find_fd (fd);
+
+        if (fde == NULL)
+          exit_with_status (-1);
+
+        lock_acquire (&filesys_lock);
+        f->eax = (uint32_t) file_length (fde->file);
+        lock_release (&filesys_lock);
+        break;
+      }
+
+    case SYS_READ:
+      {
+        int fd = (int) get_arg (f, 1);
+        uint8_t *buffer = (uint8_t *) get_arg (f, 2);
+        unsigned size = (unsigned) get_arg (f, 3);
+
+        check_valid_buffer (buffer, size);
+
+        if (fd == 0)
+          {
+            unsigned i;
+            for (i = 0; i < size; i++)
+              buffer[i] = input_getc ();
+            f->eax = size;
+          }
+        else
+          {
+            struct fd_entry *fde = find_fd (fd);
+            if (fde == NULL)
+              exit_with_status (-1);
+
+            lock_acquire (&filesys_lock);
+            f->eax = (uint32_t) file_read (fde->file, buffer, size);
+            lock_release (&filesys_lock);
+          }
+        break;
+      }
 
     case SYS_WRITE:
       {
@@ -167,24 +313,64 @@ syscall_handler (struct intr_frame *f)
           }
         else
           {
-            f->eax = (uint32_t) -1;
+            struct fd_entry *fde = find_fd (fd);
+            if (fde == NULL)
+              exit_with_status (-1);
+
+            lock_acquire (&filesys_lock);
+            f->eax = (uint32_t) file_write (fde->file, buffer, size);
+            lock_release (&filesys_lock);
           }
         break;
       }
 
-    case SYS_EXEC:
-    case SYS_WAIT:
-    case SYS_CREATE:
-    case SYS_REMOVE:
-    case SYS_OPEN:
-    case SYS_FILESIZE:
-    case SYS_READ:
     case SYS_SEEK:
+      {
+        int fd = (int) get_arg (f, 1);
+        unsigned position = (unsigned) get_arg (f, 2);
+        struct fd_entry *fde = find_fd (fd);
+
+        if (fde == NULL)
+          exit_with_status (-1);
+
+        lock_acquire (&filesys_lock);
+        file_seek (fde->file, position);
+        lock_release (&filesys_lock);
+        break;
+      }
+
     case SYS_TELL:
+      {
+        int fd = (int) get_arg (f, 1);
+        struct fd_entry *fde = find_fd (fd);
+
+        if (fde == NULL)
+          exit_with_status (-1);
+
+        lock_acquire (&filesys_lock);
+        f->eax = (uint32_t) file_tell (fde->file);
+        lock_release (&filesys_lock);
+        break;
+      }
+
     case SYS_CLOSE:
+      {
+        int fd = (int) get_arg (f, 1);
+        struct fd_entry *fde = find_fd (fd);
+
+        if (fde == NULL)
+          exit_with_status (-1);
+
+        list_remove (&fde->elem);
+        lock_acquire (&filesys_lock);
+        file_close (fde->file);
+        lock_release (&filesys_lock);
+        free (fde);
+        break;
+      }
+
     default:
-      thread_current ()->exit_code = -1;
-      thread_exit ();
+      exit_with_status (-1);
       break;
     }
 }

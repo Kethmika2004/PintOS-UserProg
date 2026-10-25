@@ -5,6 +5,8 @@
 #include <list.h>
 #include <stdint.h>
 
+struct child_status;
+
 /* States in a thread's life cycle. */
 enum thread_status
   {
@@ -97,6 +99,10 @@ struct thread
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /* Page directory. */
     int exit_code;                      /* Process exit status. */
+    struct list children;               /* Child records (struct child_status). */
+    struct child_status *my_status;     /* This thread's record in its parent's list. */
+    struct list open_files;             /* Open files (struct fd_entry). */
+    int next_fd;                        /* Next file descriptor number to hand out. */
 #endif
 
     /* Owned by thread.c. */

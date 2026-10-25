@@ -1,12 +1,14 @@
 #include "userprog/process.h"
 #include <debug.h>
 #include <inttypes.h>
+#include <list.h>
 #include <round.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "userprog/gdt.h"
 #include "userprog/pagedir.h"
+#include "userprog/syscall.h"
 #include "userprog/tss.h"
 #include "filesys/directory.h"
 #include "filesys/file.h"
@@ -14,13 +16,38 @@
 #include "threads/flags.h"
 #include "threads/init.h"
 #include "threads/interrupt.h"
+#include "threads/malloc.h"
 #include "threads/palloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 #define MAX_ARGS 64
 
+/* Arguments passed from process_execute() to start_process(). */
+struct exec_helper
+  {
+    char *fn_copy;                 /* Page holding the command line. */
+    struct child_status *status;   /* Shared record for this child. */
+  };
+
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
+static void release_status (struct child_status *status);
+
+/* Decrements the reference count of STATUS and frees it when the last
+   reference is released. */
+static void
+release_status (struct child_status *status)
+{
+  bool free_now;
+
+  lock_acquire (&status->lock_ref);
+  status->ref_count--;
+  free_now = (status->ref_count == 0);
+  lock_release (&status->lock_ref);
+
+  if (free_now)
+    free (status);
+}
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
@@ -30,27 +57,73 @@ tid_t
 process_execute (const char *file_name) 
 {
   char *fn_copy;
+  struct exec_helper *helper;
+  struct child_status *status;
   tid_t tid;
-
-  // Local buffer to hold the program name, which is extracted from file_name
   char prog_name[16];
   char *save_ptr;
 
-  // make a copy of file_name to extract the program name
+  /* Extract the program name for the new thread's name. */
   strlcpy (prog_name, file_name, sizeof prog_name);
   strtok_r (prog_name, " ", &save_ptr);
 
-  /* Make a copy of FILE_NAME.
-     Otherwise there's a race between the caller and load(). */
+  /* Allocate a page for the command line, the startup helper, and the
+     shared child status record. */
   fn_copy = palloc_get_page (0);
   if (fn_copy == NULL)
     return TID_ERROR;
+
+  helper = malloc (sizeof *helper);
+  if (helper == NULL)
+    {
+      palloc_free_page (fn_copy);
+      return TID_ERROR;
+    }
+
+  status = malloc (sizeof *status);
+  if (status == NULL)
+    {
+      free (helper);
+      palloc_free_page (fn_copy);
+      return TID_ERROR;
+    }
+
+  /* Initialize the shared child status record. */
+  status->tid = TID_ERROR;
+  status->has_been_waited = false;
+  sema_init (&status->sema_load, 0);
+  status->load_success = false;
+  sema_init (&status->sema_exit, 0);
+  status->exit_status = -1;
+  status->ref_count = 2;
+  lock_init (&status->lock_ref);
+
   strlcpy (fn_copy, file_name, PGSIZE);
+  helper->fn_copy = fn_copy;
+  helper->status = status;
 
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (prog_name, PRI_DEFAULT, start_process, fn_copy);
+  tid = thread_create (prog_name, PRI_DEFAULT, start_process, helper);
   if (tid == TID_ERROR)
-    palloc_free_page (fn_copy); 
+    {
+      palloc_free_page (fn_copy);
+      free (helper);
+      free (status);
+      return TID_ERROR;
+    }
+
+  status->tid = tid;
+  list_push_back (&thread_current ()->children, &status->elem);
+
+  /* Wait for the child to finish loading its executable and stack. */
+  sema_down (&status->sema_load);
+  if (!status->load_success)
+    {
+      list_remove (&status->elem);
+      release_status (status);
+      return TID_ERROR;
+    }
+
   return tid;
 }
 
@@ -120,53 +193,53 @@ push_arguments (char **argv, int argc, void **esp)
 /* A thread function that loads a user process and starts it
    running. */
 static void
-start_process (void *file_name_)
+start_process (void *aux_)
 {
-  char *file_name = file_name_;
+  struct exec_helper *helper = aux_;
+  char *file_name = helper->fn_copy;
+  struct child_status *status = helper->status;
   struct intr_frame if_;
-  bool success;
+  bool success = false;
+  bool too_many_args = false;
 
   char *argv[MAX_ARGS];
-  int argc;
+  int argc = 0;
   char *token, *save_ptr;
 
-  argc = 0;
+  free (helper);
+  thread_current ()->my_status = status;
 
-  // Tokenize command line in place within fn_copy.
+  /* Tokenize command line in place within file_name. */
   for (token = strtok_r (file_name, " ", &save_ptr); token != NULL;
        token = strtok_r (NULL, " ", &save_ptr))
     {
       if (argc >= MAX_ARGS)
         {
-          palloc_free_page (file_name);
-          thread_exit ();
+          too_many_args = true;
+          break;
         }
       argv[argc++] = token;
     }
 
-  // Handle empty or whitespace-only inputs without calling load(NULL).
-  if (argc == 0)
+  /* Initialize interrupt frame, load executable, and set up user stack
+     only if command-line tokenization produced between 1 and MAX_ARGS args. */
+  if (!too_many_args && argc > 0)
     {
-      palloc_free_page (file_name);
-      thread_exit ();
+      memset (&if_, 0, sizeof if_);
+      if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
+      if_.cs = SEL_UCSEG;
+      if_.eflags = FLAG_IF | FLAG_MBS;
+      success = load (argv[0], &if_.eip, &if_.esp);
+      if (success)
+        success = push_arguments (argv, argc, &if_.esp);
     }
 
-  // Initialize interrupt frame and load executable.
-  // Pass argv[0] (only the program name), not the full string.
-  memset (&if_, 0, sizeof if_);
-  if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
-  if_.cs = SEL_UCSEG;
-  if_.eflags = FLAG_IF | FLAG_MBS;
-  success = load (argv[0], &if_.eip, &if_.esp);
-
-  // Set up stack arguments only after load() succeeds and initializes if_.esp.
-  if (success)
-    success = push_arguments (argv, argc, &if_.esp);
-
-  // Arguments are copied into user space; free the command line page now.
+  /* Record final load result, wake the waiting parent, and free the
+     command-line page before either exiting on failure or entering user mode. */
+  status->load_success = success;
+  sema_up (&status->sema_load);
   palloc_free_page (file_name);
 
-  // If load or stack setup failed, quit.
   if (!success) 
     thread_exit ();
 
@@ -185,15 +258,31 @@ start_process (void *file_name_)
    exception), returns -1.  If TID is invalid or if it was not a
    child of the calling process, or if process_wait() has already
    been successfully called for the given TID, returns -1
-   immediately, without waiting.
-
-   This function will be implemented in problem 2-2.  For now, it
-   does nothing. */
+   immediately, without waiting. */
 int
-process_wait (tid_t child_tid UNUSED) 
+process_wait (tid_t child_tid) 
 {
-  while (1);   // TEMP: replaced when we do the wait syscall
-  return -1;
+  struct thread *cur = thread_current ();
+  struct list_elem *e;
+  struct child_status *status = NULL;
+
+  for (e = list_begin (&cur->children); e != list_end (&cur->children);
+       e = list_next (e))
+    {
+      struct child_status *s = list_entry (e, struct child_status, elem);
+      if (s->tid == child_tid)
+        {
+          status = s;
+          break;
+        }
+    }
+
+  if (status == NULL || status->has_been_waited)
+    return -1;
+
+  status->has_been_waited = true;
+  sema_down (&status->sema_exit);
+  return status->exit_status;
 }
 
 /* Free the current process's resources. */
@@ -220,6 +309,35 @@ process_exit (void)
       cur->pagedir = NULL;
       pagedir_activate (NULL);
       pagedir_destroy (pd);
+    }
+
+  /* Close any files left open by this process. */
+  while (!list_empty (&cur->open_files))
+    {
+      struct list_elem *e = list_pop_front (&cur->open_files);
+      struct fd_entry *fde = list_entry (e, struct fd_entry, elem);
+      lock_acquire (&filesys_lock);
+      file_close (fde->file);
+      lock_release (&filesys_lock);
+      free (fde);
+    }
+
+  /* Notify the parent of this process's exit status and release the
+     child reference to the shared status record. */
+  if (cur->my_status != NULL)
+    {
+      cur->my_status->exit_status = cur->exit_code;
+      sema_up (&cur->my_status->sema_exit);
+      release_status (cur->my_status);
+      cur->my_status = NULL;
+    }
+
+  /* Release the parent reference to all remaining child status records. */
+  while (!list_empty (&cur->children))
+    {
+      struct list_elem *e = list_pop_front (&cur->children);
+      struct child_status *s = list_entry (e, struct child_status, elem);
+      release_status (s);
     }
 }
 
@@ -322,6 +440,8 @@ load (const char *file_name, void (**eip) (void), void **esp)
   bool success = false;
   int i;
 
+  lock_acquire (&filesys_lock);
+
   /* Allocate and activate page directory. */
   t->pagedir = pagedir_create ();
   if (t->pagedir == NULL) 
@@ -420,6 +540,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
  done:
   /* We arrive here whether the load is successful or not. */
   file_close (file);
+  lock_release (&filesys_lock);
   return success;
 }
 

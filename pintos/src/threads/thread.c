@@ -464,6 +464,10 @@ init_thread (struct thread *t, const char *name, int priority)
   t->priority = priority;
 #ifdef USERPROG
   t->exit_code = -1;
+  list_init (&t->children);
+  t->my_status = NULL;
+  list_init (&t->open_files);
+  t->next_fd = 2;
 #endif
   t->magic = THREAD_MAGIC;
 
